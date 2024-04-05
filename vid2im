@@ -1,0 +1,158 @@
+import cv2
+import torch
+import torch.nn as nn
+import numpy as np
+
+class MaskedConv3d(nn.Conv3d):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, dilation=1, groups=1, bias=True):
+        super(MaskedConv3d, self).__init__(in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias)
+        # Check typing
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size,) * 3
+        # Initialize mask as ones with zeros over the right-most column  
+        self.mask = nn.Parameter(torch.ones(out_channels, in_channels, *kernel_size), requires_grad=False)
+        self.mask[:, :, :, :, -1] = 0  # Setting zeros over the right-most column
+
+    def forward(self, input):
+        weight = self.weight * self.mask
+        return nn.functional.conv3d(input, weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+
+class conv_block_masked(nn.Module):
+    def __init__(self, ch_in, ch_out):
+        super(conv_block_masked, self).__init__()
+        self.conv = nn.Sequential(
+            MaskedConv3d(ch_in, ch_out, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm3d(ch_out),
+            nn.ReLU(inplace=True),
+            MaskedConv3d(ch_out, ch_out, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm3d(ch_out),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self,x):
+        x = self.conv(x)
+        return x
+
+class conv_block(nn.Module):
+    def __init__(self, ch_in, ch_out):
+        super(conv_block, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(ch_in, ch_out, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(ch_out),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(ch_out, ch_out, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(ch_out),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self,x):
+        x = self.conv(x)
+        return x
+
+class up_conv(nn.Module):
+    def __init__(self,ch_in,ch_out):
+        super(up_conv, self).__init__()
+        self.up = nn.Sequential(
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(ch_in, ch_out, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(ch_out),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self,x):
+        x = self.up(x)
+        return x
+
+class Vid2Im(nn.Module):
+    def __init__(self, in_channels):
+        super(Vid2Im, self).__init__()
+
+        self.Maxpool = nn.MaxPool3d(kernel_size=2, stride=2)
+
+        self.Conv1 = conv_block_masked(ch_in=in_channels, ch_out=64)
+        self.Conv2 = conv_block_masked(ch_in=64, ch_out=128)
+        self.Conv3 = conv_block_masked(ch_in=128, ch_out=256)
+        self.Conv4 = conv_block_masked(ch_in=256, ch_out=512)
+
+        self.Up4 = up_conv(ch_in=512, ch_out=256)
+        self.Up_conv4 = conv_block(ch_in=512, ch_out=256)
+
+        self.Up3 = up_conv(ch_in=256, ch_out=128)
+        self.Up_conv3 = conv_block(ch_in=256, ch_out=128)
+
+        self.Up2 = up_conv(ch_in=128, ch_out=64)
+        self.Up_conv2 = conv_block(ch_in=128, ch_out=64)
+
+        self.Conv = nn.Conv2d(64, 3, kernel_size=1, stride=1, padding=0)
+        self.active = torch.nn.Sigmoid()
+        
+    def forward(self, x):
+        x_, _ = torch.max(x, dim=4)
+        
+        # encoding path    
+        x = self.Conv1(x)
+        x0, _ = torch.max(x, dim=4)
+
+        x = self.Maxpool(x)
+        x = self.Conv2(x)
+        x1, _ = torch.max(x, dim=4)
+        
+        x = self.Maxpool(x)
+        x = self.Conv3(x)
+        x2, _ = torch.max(x, dim=4)
+
+        x = self.Maxpool(x)
+        x = self.Conv4(x)
+
+        # Convert to 2d
+        x = torch.squeeze(x, 2)
+        
+        # decoding + concat path
+        x = self.Up4(x)
+        x = torch.cat((x2, x), dim=1)
+        x = self.Up_conv4(x)
+
+        x = self.Up3(x)
+        x = torch.cat((x1, x), dim=1)
+        x = self.Up_conv3(x)
+
+        x = self.Up2(x)
+        x = torch.cat((x0, x), dim=1)
+        x = self.Up_conv2(x)
+
+        x = self.Conv(x)
+        x += x_
+        return self.active(x)
+
+
+def imagify(y):
+    frame = y[0, :, :, :].detach().numpy()
+    frame = (frame * 255).astype(np.uint8).transpose(1, 2, 0)
+    return frame
+
+# Main function to stream the video
+def stream_video(model):
+    X = torch.rand(2, 3, 8, 8, 8)
+    # Open a window
+    cv2.namedWindow('Video', cv2.WINDOW_NORMAL)
+    cv2.resizeWindow('Video', 640, 480)  # Adjust window size as needed
+
+    while True:
+        # Generate a frame
+        y = model(X)
+        frame = imagify(y)
+        
+        # Update X
+        y = y.unsqueeze(-1)
+        X = X[:, :, :, :, 1:]
+        X = torch.cat((X, y), dim=4)
+        
+        # Display the frame
+        cv2.imshow('Video', frame)
+        
+        # Check for the 'q' key to quit the loop
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    # Release the window and close it
+    cv2.destroyAllWindows()
